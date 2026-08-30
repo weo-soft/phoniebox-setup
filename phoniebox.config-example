@@ -3,8 +3,7 @@
 # =============================================================================
 
 # Copy this file to phoniebox.config and adjust the values:
-#     cp phoniebox.config-config phoniebox.config
-#     chmod 600 phoniebox.config
+#     cp phoniebox.config-example phoniebox.config
 
 
 # This file contains the APPLICATION options for the non-interactive
