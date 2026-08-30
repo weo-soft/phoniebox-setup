@@ -9,7 +9,7 @@ on a Raspberry Pi — fully automated over SSH, without prompts.
 | `.env` | **Script configuration** — SSH connection data (`PI_HOST`, `SSH_USER`, `SSH_PASSWORD`) and the optional GitHub source URL (`SOURCE_URL`). Contains credentials, **never uploaded to the Pi**, **never committed to git** (see `.gitignore`). Create it from `.env-example`. |
 | `.env-example` | **Template** for `.env` with example values. Copy it and fill in your values: `cp .env-example .env && chmod 600 .env`. |
 | `phoniebox.config` | **Application configuration** — all non-interactive installer options (`GIT_USER`, `GIT_BRANCH`, `ENABLE_*`, ...). This is the file transferred to the installer. |
-| `phoniebox.config-example` | **Template** for `phoniebox.config` with example values. Copy it and fill in your values: `cp phoniebox.config phoniebox.config`. |
+| `phoniebox.config-example` | **Template** for `phoniebox.config` with example values. Copy it and fill in your values: `cp phoniebox.config-example phoniebox.config`. |
 
 ## Configuration separation
 
