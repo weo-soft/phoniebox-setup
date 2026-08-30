@@ -1,0 +1,131 @@
+# =============================================================================
+# Phoniebox (RPi-Jukebox-RFID future3) — Application configuration
+# =============================================================================
+
+# Copy this file to phoniebox.config and adjust the values:
+#     cp phoniebox.config-config phoniebox.config
+#     chmod 600 phoniebox.config
+
+
+# This file contains the APPLICATION options for the non-interactive
+# installation. It is uploaded to the Raspberry Pi, where the official
+# installer (install-jukebox.sh) executes it in NON-INTERACTIVE mode:
+#
+#     bash install-jukebox.sh --config <this file>
+#
+# NOTE: This file is transferred to the Pi — it must NOT contain any SSH
+# credentials or other connection data. The script's own settings (SSH
+# connection, source URL) live in .env, which is never uploaded.
+#
+# The format is a flat KEY=VALUE list (no YAML) — the file is loaded by the
+# installer via `source`. Quoted values are allowed (e.g.
+# RFID_READER_PARAMS="spi_ce=0;pin_irq=24").
+#
+# All options are optional and documented under:
+#   documentation/builders/installation.md  ->  "Non-Interactive Installation"
+#
+# Unset options use the installer's defaults.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Phoniebox source (GitHub)
+# -----------------------------------------------------------------------------
+# To install from a fork/feature branch, either set GIT_USER/GIT_BRANCH here,
+# or give a complete GitHub URL (recommended) in the script's own
+# configuration file .env (key SOURCE_URL) or via
+# ./setup-phoniebox.sh ... --source <url>.
+GIT_USER=MiczFlor
+GIT_BRANCH=future3/main
+
+# -----------------------------------------------------------------------------
+# System
+# -----------------------------------------------------------------------------
+# Configure a static IP address. For an installation over SSH, "false" is
+# recommended so the Pi's network configuration is left untouched.
+ENABLE_STATIC_IP=true
+# Set up the WiFi autohotspot fallback service (only makes sense with WiFi setup)
+ENABLE_AUTOHOTSPOT=false
+DISABLE_BLUETOOTH=true
+DISABLE_BOOT_SCREEN=true
+DISABLE_BOOT_LOGS_PRINT=true
+
+# Run apt-get full-upgrade + autoremove before the installation (takes longer)
+UPDATE_RASPI_OS=true
+
+# -----------------------------------------------------------------------------
+# MPD (Music Player Daemon)
+# -----------------------------------------------------------------------------
+SETUP_MPD=true
+ENABLE_MPD_OVERWRITE_INSTALL=true
+
+# -----------------------------------------------------------------------------
+# RFID reader
+# -----------------------------------------------------------------------------
+# IMPORTANT: With ENABLE_RFID_READER=true, RFID_READER_MODULE MUST be set,
+# otherwise the installer aborts.
+# RFID_READER_MODULE accepts BOTH the technical module name and the canonical
+# display name. The setup script maps the canonical name to the technical
+# module name automatically before the config is uploaded to the Pi.
+#   technical module      | canonical name
+#   ----------------------+----------------------------------------------------
+#   pn532_i2c_py532       | PN532 reader via I2C using py532 library
+#   rc522_spi             | MFRC522 via SPI
+#   rdm6300_serial        | RDM6300 via serial UART
+#   mfrc522_i2c           | MFRC522 Reader using I2C via the mfrc522_i2c library
+#   generic_nfcpy         | Generic NFCPY NFC Reader Module
+#   generic_usb           | Generic USB Reader
+
+# Canonical names contain spaces — wrap them in quotes so the value stays
+# intact. On the command line quotes are REQUIRED (the shell would split the
+# value); in this file they are recommended (also keeps the config directly
+# usable by the official installer). Examples:
+#   RFID_READER_MODULE="MFRC522 via SPI"                    (= rc522_spi)
+#   RFID_READER_MODULE="PN532 reader via I2C using py532 library"   (= pn532_i2c_py532)
+# Technical module names (no spaces) never need quotes:
+#   RFID_READER_MODULE=rdm6300_serial
+# Reader parameters (only needed if the reader cannot determine a unique
+# configuration automatically), e.g.:
+#   RFID_READER_PARAMS="device_path=usb:072f:2200"   (generic_nfcpy)
+#   RFID_READER_PARAMS="spi_ce=0;pin_irq=24"         (rc522_spi)
+
+# No reader available? -> set ENABLE_RFID_READER=false
+ENABLE_RFID_READER=true
+RFID_READER_MODULE=generic_nfcpy
+RFID_READER_PARAMS="device_path=usb:072f:2200"
+
+# Install the reader's dependencies: "auto" (default) or "no"
+RFID_READER_DEPS=auto
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
+ENABLE_SAMBA=false
+ENABLE_WEBAPP=true
+
+# Which precompiled WebApp bundle to download:
+#   release-only (default) — the exact-commit RELEASE bundle; only works with
+#                            the upstream release branch (GIT_USER=MiczFlor,
+#                            GIT_BRANCH=future3/main).
+#   true                   — the exact-commit DEVELOPMENT bundle; required for
+#                            forks and development/feature branches.
+# Forks and development branches require the development bundle; the release
+# bundle only works with the upstream release branch.
+ENABLE_WEBAPP_PROD_DOWNLOAD=release-only
+ENABLE_KIOSK_MODE=true
+
+# -----------------------------------------------------------------------------
+# Audio
+# -----------------------------------------------------------------------------
+# Disable the Pi's on-chip audio (recommended with external sound cards/HATs)
+DISABLE_ONBOARD_AUDIO=true
+
+# Enable a HiFiBerry HAT, e.g.:
+# HIFIBERRY_BOARD=hifiberry-dacplus
+
+# -----------------------------------------------------------------------------
+# Existing installation
+# -----------------------------------------------------------------------------
+# "backup" (default): an existing installation is moved to
+#                      ~/RPi-Jukebox-RFID.bak-<timestamp>
+# "remove": it is deleted.
+EXISTING_INSTALL_ACTION=remove

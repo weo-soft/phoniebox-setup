@@ -1,0 +1,6 @@
+# Never commit the real config files — they contain credentials!
+# Use the -example templates:
+#   cp .env-example .env
+#   cp phoniebox.config-example phoniebox.config
+.env
+phoniebox.config
