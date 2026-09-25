@@ -90,6 +90,32 @@ resolve_rfid_reader_module() {
     return 1
 }
 
+# Python support a reader module needs inside the application's venv.
+rfid_module_package() {
+    case "$1" in
+        generic_nfcpy) printf 'nfc' ;;
+        generic_usb) printf 'evdev' ;;
+        rc522_spi) printf 'pirc522' ;;
+        pn532_i2c_py532) printf 'py532lib' ;;
+        mfrc522_i2c) printf 'mfrc522_i2c' ;;
+        rdm6300_serial) printf 'serial' ;;
+        *) printf '' ;;
+    esac
+}
+
+# The same support as it is named in the documentation (package and import name).
+rfid_module_package_label() {
+    case "$1" in
+        generic_nfcpy) printf 'nfcpy (nfc)' ;;
+        generic_usb) printf 'evdev' ;;
+        rc522_spi) printf 'pirc522' ;;
+        pn532_i2c_py532) printf 'py532lib' ;;
+        mfrc522_i2c) printf 'mfrc522_i2c' ;;
+        rdm6300_serial) printf 'pyserial (serial)' ;;
+        *) printf '' ;;
+    esac
+}
+
 # Interface class of a reader module: which part of the Pi the reader uses.
 rfid_module_interface() {
     case "$1" in
@@ -308,6 +334,30 @@ fi
 printf 'user=%s\n' "$(id -un 2> /dev/null)"
 printf 'groups=%s\n' "$(id -nG 2> /dev/null | tr ' ' ';')"
 
+# State of the jukebox service: the installer's reader registration exits
+# without configuring anything while it is active
+service=unknown
+if command -v systemctl > /dev/null 2>&1; then
+    service="$(XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user is-active jukebox-daemon 2> /dev/null || true)"
+fi
+[ -n "$service" ] || service=unknown
+printf 'service=%s\n' "$service"
+
+# Settings that the reader's own setup applies on the Pi
+udev_nfc=missing
+if [ -f /etc/udev/rules.d/50-usb-nfc-rule.rules ]; then
+    udev_nfc=present
+fi
+printf 'udev_nfc=%s\n' "$udev_nfc"
+printf 'udev_nfc_ids=%s\n' "$(sed -n 's/.*ATTRS{idVendor}=="\([0-9a-fA-F]\{4\}\)".*ATTRS{idProduct}=="\([0-9a-fA-F]\{4\}\)".*/\1:\2/p' /etc/udev/rules.d/50-usb-nfc-rule.rules 2> /dev/null | paste -sd';' -)"
+
+nfcpy_blacklist=missing
+if [ -f /etc/modprobe.d/disable_driver_jukebox_nfcpy.conf ]; then
+    nfcpy_blacklist=present
+fi
+printf 'nfcpy_blacklist=%s\n' "$nfcpy_blacklist"
+printf 'kernel_nfc_modules=%s\n' "$(lsmod 2> /dev/null | awk '/^(pn533_usb|port100|nfc) / { print $1 }' | paste -sd';' -)"
+
 install_dir="$HOME/RPi-Jukebox-RFID"
 if [ -d "$install_dir" ]; then
     printf 'installation=present\n'
@@ -323,6 +373,18 @@ try:
     import nfc.clf.device as device
     print('nfcpy=present')
     print('nfcpy_ids=' + ';'.join('%04x:%04x' % key for key in device.usb_device_map))
+except Exception:
+    pass
+try:
+    import importlib.util
+    states = []
+    for name in ('nfc', 'evdev', 'pirc522', 'py532lib', 'mfrc522_i2c', 'serial'):
+        try:
+            present = importlib.util.find_spec(name) is not None
+        except Exception:
+            present = False
+        states.append('%s:%s' % (name, 'present' if present else 'missing'))
+    print('reader_pkg=' + ';'.join(states))
 except Exception:
     pass
 PY
@@ -700,6 +762,114 @@ rfid_check_serial() {
     return 0
 }
 
+# State of one Python package in the venv of the Pi.
+rfid_package_state() {
+    local entry
+    while IFS= read -r entry; do
+        case "$entry" in
+            "$1:present") printf 'present'; return 0 ;;
+            "$1:missing") printf 'missing'; return 0 ;;
+        esac
+    done < <(printf '%s\n' "$(rfid_report_value "$RFID_CHECK_REPORT" reader_pkg)" | tr ';' '\n')
+    printf 'unknown'
+}
+
+# Packages and settings the reader needs at runtime: its Python support in the
+# venv and the settings that the reader's own setup applies on the Pi.
+rfid_check_reader_prerequisites() {
+    local module="$1" package label state
+
+    package="$(rfid_module_package "$module")"
+    [ -n "$package" ] || return 0
+    label="$(rfid_module_package_label "$module")"
+
+    if [ "$(rfid_report_value "$RFID_CHECK_REPORT" venv)" != "present" ]; then
+        rfid_note "the application is not installed on the Pi yet, so its reader support is installed by the installation"
+        return 0
+    fi
+
+    state="$(rfid_package_state "$package")"
+    if [ "$state" = "present" ]; then
+        rfid_line "support" "$label is installed in the venv"
+    elif [ "$state" = "unknown" ]; then
+        rfid_note "the venv on the Pi did not report its reader support; $label cannot be checked"
+    elif [ "$RFID_CHECK_DEPS" = "no" ]; then
+        rfid_warn "The reader support $label is not installed in the venv, and RFID_READER_DEPS=no skips its installation."
+        rfid_note "Set RFID_READER_DEPS=auto in $RFID_CHECK_CONFIG_FILE, or install the reader's"
+        rfid_note "requirements.txt in the venv on the Pi."
+    elif [ "$RFID_CHECK_STAGE" = "post" ]; then
+        rfid_warn "The reader support $label is missing in the venv although the installation ran."
+        rfid_note "Install it on the Pi with the reader's requirements.txt:"
+        rfid_note "~/RPi-Jukebox-RFID/.venv/bin/pip install -r ~/RPi-Jukebox-RFID/src/jukebox/components/rfid/hardware/$module/requirements.txt"
+    else
+        rfid_note "the reader support $label is installed by the installation (RFID_READER_DEPS=auto)"
+    fi
+
+    if [ "$module" = "generic_nfcpy" ]; then
+        rfid_check_nfcpy_settings
+    fi
+    return 0
+}
+
+# Settings that the generic_nfcpy reader setup applies on the Pi: the udev rule
+# that hands the reader to the group 'plugdev' and the kernel modules that would
+# claim the reader otherwise.
+rfid_check_nfcpy_settings() {
+    local device_path reader_id udev_ids
+
+    device_path="$(rfid_param_value "$RFID_CHECK_PARAMS" device_path)"
+    case "$device_path" in
+        usb:*) reader_id="${device_path#usb:}" ;;
+        *) reader_id="" ;;
+    esac
+
+    if [ "$(rfid_report_value "$RFID_CHECK_REPORT" udev_nfc)" = "present" ]; then
+        udev_ids="$(rfid_report_value "$RFID_CHECK_REPORT" udev_nfc_ids)"
+        if [ -n "$reader_id" ] && ! rfid_list_contains "$udev_ids" "$reader_id"; then
+            rfid_warn "The udev rule on the Pi does not cover the configured reader '$reader_id'."
+            rfid_note "It covers: ${udev_ids:-nothing}. The rule hands the device to the group 'plugdev'."
+        fi
+    elif [ "$RFID_CHECK_STAGE" = "post" ] || [ "$RFID_CHECK_DEPS" = "no" ]; then
+        rfid_warn "The udev rule for the USB NFC reader is missing on the Pi."
+        rfid_note "Without /etc/udev/rules.d/50-usb-nfc-rule.rules the reader belongs to root"
+        rfid_note "and the jukebox cannot open it."
+    else
+        rfid_note "the udev rule for the USB reader is created by the installation"
+    fi
+
+    case "$(rfid_report_value "$RFID_CHECK_REPORT" kernel_nfc_modules)" in
+        *pn533_usb* | *port100*)
+            if [ "$(rfid_report_value "$RFID_CHECK_REPORT" nfcpy_blacklist)" != "present" ]; then
+                rfid_warn "The kernel module $(rfid_report_value "$RFID_CHECK_REPORT" kernel_nfc_modules) claims the USB NFC reader."
+                rfid_note "The reader setup disables it; as long as it is loaded, nfcpy cannot open the reader."
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# The installer's reader registration exits without configuring anything while
+# the jukebox service of an existing installation is active.
+rfid_check_service() {
+    local service modules
+
+    service="$(rfid_report_value "$RFID_CHECK_REPORT" service)"
+    [ "$service" = "active" ] || return 0
+
+    if [ "$RFID_CHECK_STAGE" = "pre" ]; then
+        rfid_line "service" "the jukebox service of the existing installation is running"
+        rfid_warn "The installer's reader registration exits without configuring anything while the jukebox service is active."
+        rfid_note "The installation would finish without a reader configuration."
+        rfid_note "Stop it before the installation: systemctl --user stop jukebox-daemon"
+    elif [ -z "$(rfid_report_value "$RFID_CHECK_REPORT" rfid_modules)" ]; then
+        # Only worth mentioning when the reader is missing as well
+        rfid_line "service" "the jukebox service of the existing installation is running"
+        rfid_note "the reader registration of the installer ran while the service was active and"
+        rfid_note "therefore did not write a reader configuration"
+    fi
+    return 0
+}
+
 # Verdict for the reader that the setup configuration asks for.
 rfid_check_configured_reader() {
     local module="$RFID_CHECK_MODULE"
@@ -717,6 +887,7 @@ rfid_check_configured_reader() {
 
     if [ -z "$module" ]; then
         rfid_line "detected" "$(rfid_detected_summary)"
+        rfid_check_service
         rfid_warn "RFID_READER_MODULE is not set in $RFID_CHECK_CONFIG_FILE although the reader setup is enabled."
         rfid_note "Set RFID_READER_MODULE to the module of the connected reader,"
         rfid_note "or disable the reader setup with ENABLE_RFID_READER=false."
@@ -732,6 +903,8 @@ rfid_check_configured_reader() {
         rfid_line "configured" "$module (RFID_READER_PARAMS not set)"
     fi
     rfid_line "detected" "$(rfid_detected_summary)"
+    rfid_check_service
+    rfid_check_reader_prerequisites "$module"
 
     case "$interface" in
         usb-nfc) rfid_check_usb_nfc "$module" "$params" ;;
@@ -771,7 +944,11 @@ rfid_check_installed_configuration() {
     rfid_line "installed" "${modules:-none} (shared/settings/rfid.yaml)"
 
     if [ -n "$RFID_CHECK_MODULE" ] && ! rfid_list_contains "$modules" "$RFID_CHECK_MODULE"; then
-        rfid_warn "The installation configured '${modules:-none}' while the setup asks for '$RFID_CHECK_MODULE'."
+        if [ -z "$modules" ]; then
+            rfid_warn "The installation wrote no reader configuration, while the setup asks for '$RFID_CHECK_MODULE'."
+        else
+            rfid_warn "The installation configured '$modules' while the setup asks for '$RFID_CHECK_MODULE'."
+        fi
         rfid_note "Correct RFID_READER_MODULE in $RFID_CHECK_CONFIG_FILE, or install the reader again."
         rfid_hint_usb_alternatives "$RFID_CHECK_MODULE"
     fi
@@ -839,6 +1016,7 @@ rfid_check_summary() {
         return 0
     fi
 
+    RFID_CHECK_STATUS="${RFID_CHECK_STATUS:-unknown} - $RFID_CHECK_WARNINGS warning(s)"
     printf '    %s warning(s): the configuration and the reader on the Pi differ.\n' "$RFID_CHECK_WARNINGS"
     if [ -n "$RFID_CHECK_SUGGESTIONS" ]; then
         printf '\n    Settings for the next run in %s:\n' "$RFID_CHECK_CONFIG_FILE"

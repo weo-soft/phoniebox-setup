@@ -10,12 +10,15 @@
 # file (--config <file>). This script handles the complete flow:
 #   1. Establish an SSH connection to the Pi (IP, user, password)
 #   2. Run pre-flight checks on the Pi (OS, architecture, python3, wget, apt)
-#   3. Check the configured RFID reader against the hardware on the Pi
+#   3. Stop the jukebox service of an existing installation (it makes the
+#      installer skip the reader registration)
 #   4. Verify the installation source (raw.githubusercontent.com)
-#   5. Upload the application config to /tmp/install_config.env
-#   6. Download install-jukebox.sh and run it non-interactively with --config
-#   7. Check the installed reader configuration against the hardware again
-#   8. optionally: reboot the Raspberry Pi (--reboot)
+#   5. Check the configured RFID reader against the hardware on the Pi
+#   6. Upload the application config to /tmp/install_config.env
+#   7. Download install-jukebox.sh and run it non-interactively with --config
+#   8. Check the installed reader configuration against the hardware again
+#   9. Start the jukebox service again
+#  10. optionally: reboot the Raspberry Pi (--reboot)
 #
 # Configuration is split into two files:
 #   - .env               the script's OWN settings: SSH connection data
@@ -560,7 +563,61 @@ preflight() {
     run_remote "$preflight_cmd"
 }
 
-# --- 3. Verify the installation source ----------------------------------------------
+# --- 3. The jukebox service of an existing installation --------------------------------
+# The reader registration of the installer (run_register_rfid_reader.py) exits
+# without configuring anything while a jukebox service is active: no reader is
+# written to shared/settings/rfid.yaml and no reader dependency is installed.
+# An installation over an existing installation finds that service running, so it
+# is stopped for the installation and started again afterwards.
+JUKEBOX_SERVICE_STOPPED="false"
+
+jukebox_service_state() {
+    run_remote 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user is-active jukebox-daemon 2> /dev/null || true'
+}
+
+stop_jukebox_service() {
+    local state
+
+    state="$(jukebox_service_state)"
+    if [[ "$state" != "active" ]]; then
+        return 0
+    fi
+
+    echo ">>> Stopping the jukebox service of the existing installation"
+    echo "    The installer skips the reader registration while the service runs."
+    if run_remote 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user stop jukebox-daemon'; then
+        JUKEBOX_SERVICE_STOPPED="true"
+        echo "    Stopped - the service is started again after the installation."
+    else
+        echo "WARNING: The jukebox service could not be stopped. The installation" >&2
+        echo "         finishes without a reader configuration in that case." >&2
+        echo "         Stop it on the Pi and run the setup again:" >&2
+        echo "             systemctl --user stop jukebox-daemon" >&2
+    fi
+}
+
+start_jukebox_service() {
+    if [[ "$JUKEBOX_SERVICE_STOPPED" != "true" ]]; then
+        return 0
+    fi
+
+    echo ""
+    echo ">>> Starting the jukebox service again"
+    if run_remote 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user start jukebox-daemon'; then
+        JUKEBOX_SERVICE_STOPPED="false"
+        echo "    Started."
+    else
+        echo "WARNING: The jukebox service could not be started again." >&2
+        echo "         Start it on the Pi with: systemctl --user start jukebox-daemon" >&2
+    fi
+    return 0
+}
+
+# A stopped service must not stay stopped when the script aborts (failing source
+# check, failed installation, interpreted signal).
+trap 'start_jukebox_service' EXIT
+
+# --- 4. Verify the installation source ----------------------------------------------
 # The installer script is fetched from raw.githubusercontent.com on the Pi. This
 # check runs before the installer changes anything there, so a branch that does
 # not exist is reported together with the setting the value came from.
@@ -596,7 +653,7 @@ check_source() {
     return 0
 }
 
-# --- 4. Check the RFID reader --------------------------------------------------------
+# --- 5. Check the RFID reader --------------------------------------------------------
 # Compares the RFID reader of the application config with the hardware on the Pi.
 # 'pre' runs before the installation, so a wrong reader module can still be
 # corrected for this run. 'post' runs after the installation and compares the
@@ -621,7 +678,7 @@ check_rfid_reader() {
     rfid_check_summary
 }
 
-# --- 5. Upload the configuration ---------------------------------------------------
+# --- 6. Upload the configuration ---------------------------------------------------
 upload_config() {
     echo ">>> Uploading config to /tmp/install_config.env ..."
     if [[ -n "$PASSWORD" ]]; then
@@ -633,7 +690,7 @@ upload_config() {
     echo "    Config uploaded ($(wc -l < "$EFFECTIVE_CONFIG") lines)."
 }
 
-# --- 6. Run the installer ------------------------------------------------------------
+# --- 7. Run the installer ------------------------------------------------------------
 # Streams the installer's console output and, once the installer announces its
 # detailed log file (INSTALLATION_LOGFILE=...), tails that log LIVE in a
 # parallel SSH session until the installation finishes (--show-log).
@@ -701,7 +758,7 @@ run_installer() {
     echo "---------------------------------------------------------------"
 }
 
-# --- 7. Optional: reboot ---------------------------------------------------------------
+# --- 8. Optional: reboot ---------------------------------------------------------------
 reboot_pi() {
     echo ">>> Rebooting the Raspberry Pi ..."
     if run_remote "sudo -n reboot"; then
@@ -719,11 +776,13 @@ reboot_pi() {
 print_banner
 test_connection
 preflight
+stop_jukebox_service
 check_source
 check_rfid_reader pre
 upload_config
 run_installer
 check_rfid_reader post
+start_jukebox_service
 
 echo ""
 echo "==============================================================="

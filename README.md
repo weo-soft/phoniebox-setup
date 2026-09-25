@@ -59,20 +59,24 @@ script handles the complete flow:
 1. Establish an SSH connection to the Pi (IP, user, password from
    `.env` or command line)
 2. Run pre-flight checks on the Pi (OS, architecture, `python3`, `wget`, `apt-get`)
-3. Check the configured RFID reader against the hardware on the Pi
+3. Stop the jukebox service of an existing installation — it makes the installer
+   skip the reader registration, see
+   [Installation over an existing installation](#installation-over-an-existing-installation)
+4. Check the configured RFID reader against the hardware on the Pi
    — see [RFID reader check](#rfid-reader-check)
-4. Verify the installation source: `installation/install-jukebox.sh` is fetched
+5. Verify the installation source: `installation/install-jukebox.sh` is fetched
    from `raw.githubusercontent.com` on the Pi, and a branch that does not exist
    aborts here — see [Setting the source](#setting-the-source-repobranch)
-5. Upload `phoniebox.config` to `/tmp/install_config.env` on the Pi
+6. Upload `phoniebox.config` to `/tmp/install_config.env` on the Pi
    (the resolved source `GIT_USER`/`GIT_BRANCH` is written into the uploaded
    file — see [Setting the source](#setting-the-source-repobranch))
-6. Download `install-jukebox.sh` and run it non-interactively with `--config`
+7. Download `install-jukebox.sh` and run it non-interactively with `--config`
    (output is streamed live, including the path of the installation log
    `INSTALLATION_LOGFILE=...`)
-7. Check the reader configuration the installer wrote against the hardware again
+8. Check the reader configuration the installer wrote against the hardware again
    — see [RFID reader check](#rfid-reader-check)
-8. optionally: reboot the Raspberry Pi (`--reboot`)
+9. Start the jukebox service again
+10. optionally: reboot the Raspberry Pi (`--reboot`)
 
 > The non-interactive mode skips the welcome and the final reboot prompts —
 > the caller is responsible for the reboot (hence the `--reboot` option).
@@ -184,6 +188,29 @@ own reason.
 > `raw.githubusercontent.com`
 > ([GitHub changelog](https://github.blog/changelog/2025-05-08-updated-rate-limits-for-unauthenticated-requests/));
 > authenticated access keeps the higher limits.
+
+## Installation over an existing installation
+
+The non-interactive installer can run over an installation that is already on
+the Pi: `EXISTING_INSTALL_ACTION=backup` moves it to
+`~/RPi-Jukebox-RFID.bak-<timestamp>`, `remove` deletes it. The running
+application is not part of that handling, and it matters for the RFID reader:
+
+- The installer's reader registration (`run_register_rfid_reader.py`) exits
+  without configuring anything while the jukebox service is active. The service
+  of the previous installation is still running, so an installation over an
+  existing installation finishes **without a reader**: no entry in
+  `shared/settings/rfid.yaml` and no reader dependency in the venv — while the
+  installation itself reports success.
+- The script therefore stops `jukebox-daemon` before the installation and
+  starts it again afterwards, so the reader registration runs and the reader
+  support is installed.
+- The [RFID reader check](#rfid-reader-check) reports the service state in both
+  stages and names the consequence when it is still running (for example when
+  stopping it failed because the service does not belong to the SSH user).
+
+The jukebox daemon is a user service of the SSH user
+(`systemctl --user jukebox-daemon`), so it is controlled without `sudo`.
 
 ## Customizing the application configuration (`phoniebox.config`)
 
@@ -302,6 +329,21 @@ What the check looks at, per reader module:
 | `rc522_spi` | `/dev/spidev*` and `dtparam=spi` in the boot config; the reader itself cannot be detected, its pins come from `RFID_READER_PARAMS` |
 | `rdm6300_serial` | `/dev/ttyAMA*`, `/dev/ttyUSB*`, `enable_uart=1` in the boot config and membership in the group `dialout` |
 | `fake_reader_gui` | nothing, the simulator needs no hardware |
+
+Next to the hardware, the check reports the prerequisites the reader needs at
+runtime:
+
+| Prerequisite | Checked as |
+| --- | --- |
+| Python support | the reader's package in the venv of the application (`nfc`, `evdev`, `pirc522`, `py532lib`, `mfrc522_i2c`, `serial`) |
+| Device access for `generic_nfcpy` | the udev rule `/etc/udev/rules.d/50-usb-nfc-rule.rules` and whether it covers the configured `usb:<id>` |
+| Kernel driver | loaded `pn533_usb`/`port100` modules without the blacklist of the reader setup — they take the reader away from nfcpy |
+| Group membership | `plugdev` for USB readers, `dialout` for serial readers |
+| Jukebox service | a running `jukebox-daemon`, see [Installation over an existing installation](#installation-over-an-existing-installation) |
+
+A missing package before the installation is a note: the installation installs
+it with `RFID_READER_DEPS=auto`. After the installation, and with
+`RFID_READER_DEPS=no`, it is a warning with the command that installs it.
 
 I²C, SPI and the serial hardware are enabled by the reader setup during the
 installation and become active with the next reboot. The check before the
