@@ -62,6 +62,9 @@ ENABLE_MPD_OVERWRITE_INSTALL=true
 # -----------------------------------------------------------------------------
 # IMPORTANT: With ENABLE_RFID_READER=true, RFID_READER_MODULE MUST be set,
 # otherwise the installer aborts.
+# The setup script compares these settings with the hardware on the Pi before
+# and after the installation and warns about every deviation (README, section
+# "RFID reader check").
 # RFID_READER_MODULE accepts BOTH the technical module name and the canonical
 # display name. The setup script maps the canonical name to the technical
 # module name automatically before the config is uploaded to the Pi.

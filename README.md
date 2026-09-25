@@ -6,6 +6,7 @@ on a Raspberry Pi — fully automated over SSH, without prompts.
 | File | Purpose |
 | --- | --- |
 | `setup-phoniebox.sh` | Installation script (run on **your own machine**) |
+| `rfid_reader.sh` | Reader names and the RFID reader check |
 | `.env` | **Script configuration** — SSH connection data (`PI_HOST`, `SSH_USER`, `SSH_PASSWORD`) and the optional GitHub source URL (`SOURCE_URL`). Contains credentials, **never uploaded to the Pi**, **never committed to git** (see `.gitignore`). Create it from `.env-example`. |
 | `.env-example` | **Template** for `.env` with example values. Copy it and fill in your values: `cp .env-example .env && chmod 600 .env`. |
 | `phoniebox.config` | **Application configuration** — all non-interactive installer options (`GIT_USER`, `GIT_BRANCH`, `ENABLE_*`, ...). This is the file transferred to the installer. |
@@ -58,13 +59,20 @@ script handles the complete flow:
 1. Establish an SSH connection to the Pi (IP, user, password from
    `.env` or command line)
 2. Run pre-flight checks on the Pi (OS, architecture, `python3`, `wget`, `apt-get`)
-3. Upload `phoniebox.config` to `/tmp/install_config.env` on the Pi
+3. Check the configured RFID reader against the hardware on the Pi
+   — see [RFID reader check](#rfid-reader-check)
+4. Verify the installation source: `installation/install-jukebox.sh` is fetched
+   from `raw.githubusercontent.com` on the Pi, and a branch that does not exist
+   aborts here — see [Setting the source](#setting-the-source-repobranch)
+5. Upload `phoniebox.config` to `/tmp/install_config.env` on the Pi
    (the resolved source `GIT_USER`/`GIT_BRANCH` is written into the uploaded
    file — see [Setting the source](#setting-the-source-repobranch))
-4. Download `install-jukebox.sh` and run it non-interactively with `--config`
+6. Download `install-jukebox.sh` and run it non-interactively with `--config`
    (output is streamed live, including the path of the installation log
    `INSTALLATION_LOGFILE=...`)
-5. optionally: reboot the Raspberry Pi (`--reboot`)
+7. Check the reader configuration the installer wrote against the hardware again
+   — see [RFID reader check](#rfid-reader-check)
+8. optionally: reboot the Raspberry Pi (`--reboot`)
 
 > The non-interactive mode skips the welcome and the final reboot prompts —
 > the caller is responsible for the reboot (hence the `--reboot` option).
@@ -130,7 +138,7 @@ Then simply run:
 | Option | Description |
 | --- | --- |
 | `--setup-config <file>` | Script configuration (SSH connection, source URL). Default: `.env` in the same directory. |
-| `-s, --source <url>` | GitHub URL with repository/branch used for the installation, e.g. `https://github.com/weo-soft/RPi-Jukebox-RFID/tree/future3/feature/installer-noninteractive-plugins`. Overrides `SOURCE_URL` from `.env`. The repository must be named `RPi-Jukebox-RFID` (the official installer only supports forks with this name). |
+| `-s, --source <url>` | GitHub URL with repository/branch used for the installation, e.g. `https://github.com/weo-soft/RPi-Jukebox-RFID/tree/future3/feature/installer-noninteractive-plugins` or the raw URL of the installer script (`https://raw.githubusercontent.com/<user>/RPi-Jukebox-RFID/<branch>/installation/install-jukebox.sh`). Overrides `SOURCE_URL` from `.env`. The repository must be named `RPi-Jukebox-RFID` (the official installer only supports forks with this name). |
 | `--rfid-reader <mod>` | RFID reader module for the installation: technical module name (e.g. `pn532_i2c_py532`) **or** canonical display name (e.g. `"PN532 reader via I2C using py532 library"`). Overrides `RFID_READER_MODULE` from `phoniebox.config`. See [RFID reader module names](#rfid-reader-module-names). |
 | `-c, --config <file>` | Application config file. Default: `phoniebox.config` in the same directory (or `APP_CONFIG` from `.env`). |
 | `-r, --reboot` | Reboot the Raspberry Pi after a successful installation (or `REBOOT=true` in `.env`). |
@@ -149,11 +157,33 @@ The source is determined in this order (first match wins):
 3. `GIT_USER`/`GIT_BRANCH` in `phoniebox.config`
 4. Default: `MiczFlor` / `future3/main`
 
-The GitHub URL has the form `https://github.com/<user>/<repo>/tree/<branch>`
-— the branch may contain slashes (e.g. `future3/feature/xyz`). When
-uploading, the script appends the resolved `GIT_USER`/`GIT_BRANCH` values to
-the transferred config, so the official installer on the Pi also installs
-from the selected fork/branch.
+Two URL forms are accepted:
+
+```text
+https://github.com/<user>/RPi-Jukebox-RFID/tree/<branch>
+https://raw.githubusercontent.com/<user>/RPi-Jukebox-RFID/<branch>/installation/install-jukebox.sh
+```
+
+The branch may contain slashes (e.g. `future3/feature/xyz`). An address that
+carries the fully qualified ref (`.../tree/refs/heads/<branch>`, as some views
+and menus produce it) is reduced to the branch name. When uploading, the script
+appends the resolved `GIT_USER`/`GIT_BRANCH` values to the transferred
+config, so the official installer on the Pi also installs from the selected
+fork/branch.
+
+Before the installation starts, the script fetches the installer script
+`installation/install-jukebox.sh` from `raw.githubusercontent.com` on the Pi:
+a branch that does not exist is answered with `404` and aborts the script with
+the name of the branch and of the setting it came from. A network problem or a
+rate limit only produces a warning — the installation then runs and reports its
+own reason.
+
+> The official installer initializes a Git checkout of the branch on the Pi
+> (`git fetch` of `refs/heads/<branch>`). GitHub limits unauthenticated
+> requests, which covers cloning over HTTPS as well as downloads from
+> `raw.githubusercontent.com`
+> ([GitHub changelog](https://github.blog/changelog/2025-05-08-updated-rate-limits-for-unauthenticated-requests/));
+> authenticated access keeps the higher limits.
 
 ## Customizing the application configuration (`phoniebox.config`)
 
@@ -213,13 +243,94 @@ The full list of options is documented under
 [`documentation/builders/installation.md` → „Non-Interactive Installation“](https://github.com/MiczFlor/RPi-Jukebox-RFID/blob/future3/main/documentation/builders/installation.md#non-interactive-installation)
 in the RPi-Jukebox-RFID repository.
 
+## RFID reader check
+
+The script compares the RFID reader that the application config asks for with
+the hardware that is connected to the Pi. The check runs twice:
+
+| Stage | Runs | Compares |
+| --- | --- | --- |
+| `pre` | after the pre-flight checks, before the installer | `ENABLE_RFID_READER`, `RFID_READER_MODULE` and `RFID_READER_PARAMS` of `phoniebox.config` with the interfaces and devices of the Pi |
+| `post` | after the installer has run | additionally the reader configuration the installer wrote (`~/RPi-Jukebox-RFID/shared/settings/rfid.yaml`) with the config and the hardware |
+
+The check only warns: it changes nothing on the Pi, does not stop the run and
+does not affect the installation. Every warning names the setting to change for
+the next run, so a wrong reader module can be corrected in
+`phoniebox.config` and the installation repeated.
+
+A run that matches looks like this:
+
+```text
+>>> Checking the RFID reader configuration (post)
+    configured : generic_nfcpy (RFID_READER_PARAMS="device_path=usb:072f:2200")
+    detected   : NFC reader on USB (072f:2200)
+    expected   : device_path=usb:072f:2200
+    result     : confirmed - device usb:072f:2200 is connected
+    installed  : generic_nfcpy (shared/settings/rfid.yaml)
+    no deviation found between the configuration and the reader on the Pi
+```
+
+A deviation is reported with a suggestion for the configuration (here from
+the `post` stage: the config asks for an SPI reader while an NFC reader is
+connected and the installation configured it):
+
+```text
+>>> Checking the RFID reader configuration (post)
+    configured : rc522_spi (RFID_READER_PARAMS not set)
+    detected   : NFC reader on USB (072f:2200)
+    WARNING: The SPI interface is still not enabled after the installation.
+             Check the installation log on the Pi for the reader setup, or enable it with
+             'sudo raspi-config nonint do_spi 0'.
+             An NFC reader supported by nfcpy is connected: 072f:2200
+             If that is the reader, set RFID_READER_MODULE=generic_nfcpy.
+    installed  : generic_nfcpy (shared/settings/rfid.yaml)
+    WARNING: The installation configured 'generic_nfcpy' while the setup asks for 'rc522_spi'.
+             Correct RFID_READER_MODULE in phoniebox.config, or install the reader again.
+    2 warning(s): the configuration and the reader on the Pi differ.
+
+    Settings for the next run in phoniebox.config:
+        RFID_READER_MODULE=generic_nfcpy
+```
+
+What the check looks at, per reader module:
+
+| Reader module | Hardware on the Pi |
+| --- | --- |
+| `generic_nfcpy` | nfcpy's own device list (its venv is on the Pi after the installation) and the USB bus for the configured `device_path` |
+| `generic_usb` | input devices whose key capabilities match the reader support, and the configured `device_name` |
+| `pn532_i2c_py532`, `mfrc522_i2c` | the I²C bus and `dtparam=i2c_arm` in the boot config; with `i2c-tools` installed also the reader address (`0x24`, `0x28`) |
+| `rc522_spi` | `/dev/spidev*` and `dtparam=spi` in the boot config; the reader itself cannot be detected, its pins come from `RFID_READER_PARAMS` |
+| `rdm6300_serial` | `/dev/ttyAMA*`, `/dev/ttyUSB*`, `enable_uart=1` in the boot config and membership in the group `dialout` |
+| `fake_reader_gui` | nothing, the simulator needs no hardware |
+
+I²C, SPI and the serial hardware are enabled by the reader setup during the
+installation and become active with the next reboot. The check before the
+installation therefore reports them as "not enabled yet", the check afterwards
+as "enabled in the boot config, active after the next reboot".
+
 ## Troubleshooting
 
+- **The reader check reports `NOT CONFIRMED`** — the printed warning names the
+  setting and the value to use. Correct `RFID_READER_MODULE`,
+  `RFID_READER_PARAMS` or `ENABLE_RFID_READER` in `phoniebox.config` and run
+  the script again. Reader modules that cannot determine their device
+  automatically (`generic_usb`, `generic_nfcpy`, `rc522_spi`) need
+  `RFID_READER_PARAMS` when several candidates are connected.
 - **`sshpass` missing** — see the prerequisites above.
 - **Installation aborts** — the installation log on the Pi
   (`~/INSTALL-<id>.log`, the path is printed during the installation as
   `INSTALLATION_LOGFILE=...`) contains the details. Common cause:
   `ENABLE_RFID_READER=true` without `RFID_READER_MODULE`.
+- **"The source is not available on GitHub"** — the branch in `--source` /
+  `SOURCE_URL` / `GIT_BRANCH` does not exist in that fork. The message names
+  the branch and the setting it came from; fix the value and run the script
+  again.
+- **The installation aborts in "Install Git & init repository"** — the official
+  installer converts its tarball download into a Git checkout and fetches
+  `refs/heads/<branch>` from github.com. A branch that does not exist, a
+  network problem or a rate limit for unauthenticated requests fails that step;
+  the installer log shows the reason
+  (`fatal: couldn't find remote ref ...`).
 - **Connection drops during the installation** — the installation can take
   20–60 minutes. The script uses `ServerAliveInterval` to keep the
   connection alive; if it drops, simply run `setup-phoniebox.sh` again

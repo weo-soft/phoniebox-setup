@@ -10,9 +10,12 @@
 # file (--config <file>). This script handles the complete flow:
 #   1. Establish an SSH connection to the Pi (IP, user, password)
 #   2. Run pre-flight checks on the Pi (OS, architecture, python3, wget, apt)
-#   3. Upload the application config to /tmp/install_config.env
-#   4. Download install-jukebox.sh and run it non-interactively with --config
-#   5. optionally: reboot the Raspberry Pi (--reboot)
+#   3. Check the configured RFID reader against the hardware on the Pi
+#   4. Verify the installation source (raw.githubusercontent.com)
+#   5. Upload the application config to /tmp/install_config.env
+#   6. Download install-jukebox.sh and run it non-interactively with --config
+#   7. Check the installed reader configuration against the hardware again
+#   8. optionally: reboot the Raspberry Pi (--reboot)
 #
 # Configuration is split into two files:
 #   - .env               the script's OWN settings: SSH connection data
@@ -34,6 +37,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CONFIG="${SCRIPT_DIR}/phoniebox.config"
 DEFAULT_SETUP_CONFIG="${SCRIPT_DIR}/.env"
+
+# Canonical reader names and the RFID reader check
+RFID_HELPER="${SCRIPT_DIR}/rfid_reader.sh"
+if [[ ! -f "$RFID_HELPER" ]]; then
+    echo "ERROR: RFID reader helper not found: $RFID_HELPER" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$RFID_HELPER"
+
+# Reader settings of the effective configuration, filled by
+# build_effective_config() and used by check_rfid_reader().
+RFID_EFFECTIVE_ENABLE="true"
+RFID_EFFECTIVE_MODULE=""
+RFID_EFFECTIVE_PARAMS=""
+RFID_EFFECTIVE_DEPS="auto"
 
 CONFIG_FILE="$DEFAULT_CONFIG"
 CONFIG_FILE_CLI=""
@@ -66,9 +85,12 @@ Options:
   --setup-config <file>  Script configuration (SSH connection, source URL)
                          (default: ${DEFAULT_SETUP_CONFIG})
   -s, --source <url>     GitHub URL with repository/branch used for the
-                         installation, e.g.
-                         https://github.com/weo-soft/RPi-Jukebox-RFID/tree/future3/feature/installer-noninteractive-plugins
-                         (overrides SOURCE_URL from .env)
+                         installation (overrides SOURCE_URL from .env).
+                         Accepted forms:
+                           https://github.com/<user>/RPi-Jukebox-RFID/tree/<branch>
+                           https://raw.githubusercontent.com/<user>/RPi-Jukebox-RFID/<branch>/installation/install-jukebox.sh
+                         The branch may contain slashes; a leading
+                         'refs/heads/' is removed.
   --rfid-reader <mod>    RFID reader module for the installation: technical
                          module name (e.g. pn532_i2c_py532) or canonical
                          display name (e.g. "PN532 reader via I2C using py532
@@ -242,33 +264,72 @@ get_config_value() {
     get_value_from "$CONFIG_FILE" "$1"
 }
 
-# Splits a GitHub web URL into GIT_USER and GIT_BRANCH.
-# Expected format: https://github.com/<user>/<repo>/tree/<branch>
+# Reduces a branch reference to its branch name. Addresses copied from a
+# GitHub branch view carry the fully qualified ref ('refs/heads/<branch>'),
+# while the installer on the Pi resolves the branch as 'refs/heads/<value>'
+# and would look for 'refs/heads/refs/heads/<branch>'.
+normalize_branch() {
+    local branch="$1"
+
+    while [[ "$branch" == "refs/heads/"* ]]; do
+        branch="${branch#refs/heads/}"
+    done
+    branch="${branch#/}"
+    branch="${branch%/}"
+
+    printf '%s' "$branch"
+}
+
+# Splits a GitHub URL into GIT_USER and GIT_BRANCH. Accepted forms:
+#   https://github.com/<user>/RPi-Jukebox-RFID/tree/<branch>
+#   https://raw.githubusercontent.com/<user>/RPi-Jukebox-RFID/<branch>/installation/install-jukebox.sh
 # The branch may contain slashes (e.g. future3/feature/xyz).
 parse_source_url() {
     local url="$1"
-    local rest user_repo user repo
+    local rest user_repo user repo branch
 
-    # Strip the protocol and the github.com prefix (also works for
-    # "github.com/...", "www.github.com/..." or "http(s)://...")
-    rest="${url#*github.com/}"
-    if [[ "$rest" == "$url" ]]; then
-        echo "ERROR: Invalid GitHub URL: $url" >&2
-        echo "        Expected format: https://github.com/<user>/<repo>/tree/<branch>" >&2
-        return 1
+    if [[ "$url" == *"raw.githubusercontent.com/"* ]]; then
+        # File URL of the installer script: the branch is everything between
+        # the repository name and the path of the script.
+        rest="${url#*raw.githubusercontent.com/}"
+        rest="${rest%%\?*}"   # drop a query string if present
+        rest="${rest%/}"
+        if [[ "$rest" != *"/installation/install-jukebox.sh" ]]; then
+            echo "ERROR: Invalid GitHub URL: $url" >&2
+            echo "        Expected format: https://raw.githubusercontent.com/<user>/<repo>/<branch>/installation/install-jukebox.sh" >&2
+            return 1
+        fi
+        rest="${rest%/installation/install-jukebox.sh}"
+        # rest is <user>/<repo>/<branch>; the branch may contain slashes
+        user="${rest%%/*}"
+        rest="${rest#*/}"
+        repo="${rest%%/*}"
+        branch="${rest#*/}"
+    else
+        # Strip the protocol and the github.com prefix (also works for
+        # "github.com/...", "www.github.com/..." or "http(s)://...")
+        rest="${url#*github.com/}"
+        if [[ "$rest" == "$url" ]]; then
+            echo "ERROR: Invalid GitHub URL: $url" >&2
+            echo "        Expected format: https://github.com/<user>/<repo>/tree/<branch>" >&2
+            echo "        or:              https://raw.githubusercontent.com/<user>/<repo>/<branch>/installation/install-jukebox.sh" >&2
+            return 1
+        fi
+        rest="${rest%/}"   # remove a trailing slash if present
+
+        if [[ "$rest" != *"/tree/"* ]]; then
+            echo "ERROR: Invalid GitHub URL (missing /tree/): $url" >&2
+            echo "        Expected format: https://github.com/<user>/<repo>/tree/<branch>" >&2
+            return 1
+        fi
+
+        user_repo="${rest%%/tree/*}"
+        branch="${rest#*/tree/}"
+        user="${user_repo%%/*}"
+        repo="${user_repo#*/}"
     fi
-    rest="${rest%/}"   # remove a trailing slash if present
 
-    if [[ "$rest" != *"/tree/"* ]]; then
-        echo "ERROR: Invalid GitHub URL (missing /tree/): $url" >&2
-        echo "        Expected format: https://github.com/<user>/<repo>/tree/<branch>" >&2
-        return 1
-    fi
-
-    user_repo="${rest%%/tree/*}"
-    branch="${rest#*/tree/}"
-    user="${user_repo%%/*}"
-    repo="${user_repo#*/}"
+    branch="$(normalize_branch "$branch")"
 
     if [[ -z "$user" || -z "$repo" || -z "$branch" ]]; then
         echo "ERROR: Could not parse GitHub URL: $url" >&2
@@ -285,67 +346,33 @@ parse_source_url() {
     return 0
 }
 
+SOURCE_ORIGIN=""
 SOURCE_URL="${SOURCE_URL_ARG:-${SETUP_SOURCE_URL:-}}"
 if [[ -n "$SOURCE_URL" ]]; then
+    if [[ -n "$SOURCE_URL_ARG" ]]; then
+        SOURCE_ORIGIN="--source"
+    else
+        SOURCE_ORIGIN="SOURCE_URL in $SETUP_CONFIG_FILE"
+    fi
     parse_source_url "$SOURCE_URL"
 else
     GIT_USER="$(get_config_value GIT_USER)"
-    GIT_BRANCH="$(get_config_value GIT_BRANCH)"
+    GIT_BRANCH="$(normalize_branch "$(get_config_value GIT_BRANCH)")"
     GIT_USER="${GIT_USER:-MiczFlor}"
     GIT_BRANCH="${GIT_BRANCH:-future3/main}"
+    SOURCE_ORIGIN="$CONFIG_FILE"
 fi
+
+# URL of the installer script: it is fetched from raw.githubusercontent.com by
+# the verification below and by the installation on the Pi.
+INSTALLER_URL="https://raw.githubusercontent.com/${GIT_USER}/RPi-Jukebox-RFID/${GIT_BRANCH}/installation/install-jukebox.sh"
 
 # --- RFID reader module: canonical names vs. technical module names ----------
 # The official installer understands the TECHNICAL module names (e.g.
-# pn532_i2c_py532). This script accepts both the technical module names and
-# the human-readable CANONICAL display names (e.g. "PN532 reader via I2C
-# using py532 library") and maps the canonical names to the module names.
-# Format of the table: "canonical display name|technical module name"
-RFID_READER_CANONICAL_NAMES=(
-    "PN532 reader via I2C using py532 library|pn532_i2c_py532"
-    "MFRC522 via SPI|rc522_spi"
-    "RDM6300 via serial UART|rdm6300_serial"
-    "MFRC522 Reader using I2C via the mfrc522_i2c library|mfrc522_i2c"
-    "Generic NFCPY NFC Reader Module|generic_nfcpy"
-    "Generic USB Reader|generic_usb"
-)
-
-# Maps a canonical reader name to its technical module name; technical module
-# names pass through unchanged. Prints the module name on stdout and returns
-# 0. Returns 1 (with an error listing all supported names) if the value is
-# neither a canonical nor a technical name.
-resolve_rfid_reader_module() {
-    local value="$1"
-    local entry canonical module
-    if [[ -z "$value" ]]; then
-        return 0
-    fi
-    # Technical module name given? -> passthrough
-    for entry in "${RFID_READER_CANONICAL_NAMES[@]}"; do
-        module="${entry#*|}"
-        if [[ "$value" == "$module" ]]; then
-            printf '%s' "$module"
-            return 0
-        fi
-    done
-    # Canonical display name given? -> map to the module name (case-insensitive)
-    for entry in "${RFID_READER_CANONICAL_NAMES[@]}"; do
-        canonical="${entry%%|*}"
-        if [[ "${value,,}" == "${canonical,,}" ]]; then
-            module="${entry#*|}"
-            printf '%s' "$module"
-            return 0
-        fi
-    done
-    echo "ERROR: Unknown RFID reader module '$value'." >&2
-    echo "Supported values (technical module or canonical name):" >&2
-    for entry in "${RFID_READER_CANONICAL_NAMES[@]}"; do
-        canonical="${entry%%|*}"
-        module="${entry#*|}"
-        echo "  - $module   ($canonical)" >&2
-    done
-    return 1
-}
+# pn532_i2c_py532). This script accepts both the technical module names and the
+# human-readable CANONICAL display names (e.g. "PN532 reader via I2C using
+# py532 library"). RFID_READER_CANONICAL_NAMES and resolve_rfid_reader_module()
+# live in rfid_reader.sh, together with the RFID reader check.
 
 # Build the effective config: remove GIT_USER/GIT_BRANCH (and the RFID reader
 # module) from the original application config and append the resolved values.
@@ -358,7 +385,7 @@ EFFECTIVE_CONFIG="$(mktemp /tmp/install_config.XXXXXX.env)"
 trap 'rm -f "$EFFECTIVE_CONFIG"' EXIT
 
 build_effective_config() {
-    local rfid_module enable_rfid resolved_module
+    local rfid_module enable_rfid resolved_module=""
     rfid_module="${RFID_READER_ARG:-$(get_config_value RFID_READER_MODULE)}"
 
     # Mirror the official installer's validation: with an enabled reader the
@@ -383,6 +410,15 @@ build_effective_config() {
         printf "RFID_READER_MODULE='%s'\n" "$resolved_module" >> "$EFFECTIVE_CONFIG"
     fi
     printf "GIT_USER='%s'\nGIT_BRANCH='%s'\n" "$GIT_USER" "$GIT_BRANCH" >> "$EFFECTIVE_CONFIG"
+
+    # Reader settings as they reach the installer, for the reader check
+    RFID_EFFECTIVE_ENABLE="$enable_rfid"
+    RFID_EFFECTIVE_MODULE="$resolved_module"
+    RFID_EFFECTIVE_PARAMS="$(get_config_value RFID_READER_PARAMS)"
+    RFID_EFFECTIVE_DEPS="$(get_config_value RFID_READER_DEPS)"
+    if [[ -z "$RFID_EFFECTIVE_DEPS" ]]; then
+        RFID_EFFECTIVE_DEPS="auto"
+    fi
 }
 build_effective_config
 
@@ -524,7 +560,68 @@ preflight() {
     run_remote "$preflight_cmd"
 }
 
-# --- 3. Upload the configuration ---------------------------------------------------
+# --- 3. Verify the installation source ----------------------------------------------
+# The installer script is fetched from raw.githubusercontent.com on the Pi. This
+# check runs before the installer changes anything there, so a branch that does
+# not exist is reported together with the setting the value came from.
+check_source() {
+    echo ">>> Verifying the installation source on the Pi ..."
+    echo "    ${INSTALLER_URL}"
+    echo "    Source: ${SOURCE_ORIGIN}"
+
+    local response=""
+    if response="$(run_remote "wget -O /dev/null --server-response '${INSTALLER_URL}' 2>&1")"; then
+        echo "    Source is available: ${GIT_USER}/RPi-Jukebox-RFID @ ${GIT_BRANCH}"
+        return 0
+    fi
+
+    if [[ "$response" == *"404"* || "$response" == *"Not Found"* ]]; then
+        echo "ERROR: The source is not available on GitHub: ${GIT_USER}/RPi-Jukebox-RFID @ ${GIT_BRANCH}" >&2
+        echo "       Check the branch name in ${SOURCE_ORIGIN}." >&2
+        echo "       The branch may contain slashes (future3/feature/xyz); a leading" >&2
+        echo "       'refs/heads/' is removed automatically." >&2
+        exit 1
+    fi
+
+    if [[ "$response" == *"command not found"* ]]; then
+        echo "ERROR: 'wget' is missing on the Pi, so no source can be downloaded there." >&2
+        echo "       Install it with: sudo apt install wget" >&2
+        exit 1
+    fi
+
+    echo "WARNING: The source could not be verified on the Pi." >&2
+    echo "         This is a network problem or a rate limit of GitHub for" >&2
+    echo "         unauthenticated requests. The installation starts anyway and" >&2
+    echo "         downloads the same URL; the installer log names the reason." >&2
+    return 0
+}
+
+# --- 4. Check the RFID reader --------------------------------------------------------
+# Compares the RFID reader of the application config with the hardware on the Pi.
+# 'pre' runs before the installation, so a wrong reader module can still be
+# corrected for this run. 'post' runs after the installation and compares the
+# reader configuration the installer wrote with the settings of this setup.
+# Both stages only warn; the installation itself stays unchanged.
+check_rfid_reader() {
+    local stage="$1"
+
+    echo ">>> Checking the RFID reader configuration ($stage)"
+    RFID_CHECK_CONFIG_FILE="$CONFIG_FILE"
+    RFID_CHECK_STAGE="$stage"
+    RFID_CHECK_ENABLE="$RFID_EFFECTIVE_ENABLE"
+    RFID_CHECK_MODULE="$RFID_EFFECTIVE_MODULE"
+    RFID_CHECK_PARAMS="$RFID_EFFECTIVE_PARAMS"
+    RFID_CHECK_DEPS="$RFID_EFFECTIVE_DEPS"
+    rfid_check_prepare
+    rfid_check_hardware
+    rfid_check_configured_reader
+    if [[ "$stage" == "post" ]]; then
+        rfid_check_installed_configuration
+    fi
+    rfid_check_summary
+}
+
+# --- 5. Upload the configuration ---------------------------------------------------
 upload_config() {
     echo ">>> Uploading config to /tmp/install_config.env ..."
     if [[ -n "$PASSWORD" ]]; then
@@ -536,7 +633,7 @@ upload_config() {
     echo "    Config uploaded ($(wc -l < "$EFFECTIVE_CONFIG") lines)."
 }
 
-# --- 4. Run the installer ------------------------------------------------------------
+# --- 6. Run the installer ------------------------------------------------------------
 # Streams the installer's console output and, once the installer announces its
 # detailed log file (INSTALLATION_LOGFILE=...), tails that log LIVE in a
 # parallel SSH session until the installation finishes (--show-log).
@@ -580,7 +677,7 @@ run_installer() {
     # TERM=dumb silences the installer's 'clear' calls (no TTY over SSH) —
     # otherwise it prints "TERM environment variable not set." repeatedly.
     install_cmd="export TERM=dumb; wget -qO /tmp/install-jukebox.sh \
-        https://raw.githubusercontent.com/${GIT_USER}/RPi-Jukebox-RFID/${GIT_BRANCH}/installation/install-jukebox.sh \
+        ${INSTALLER_URL} \
         && bash /tmp/install-jukebox.sh --config /tmp/install_config.env"
     echo ">>> Starting installation (non-interactive, --config) ..."
     echo "    Duration: approx. 20-60 minutes. Do not interrupt the connection!"
@@ -604,7 +701,7 @@ run_installer() {
     echo "---------------------------------------------------------------"
 }
 
-# --- 5. Optional: reboot ---------------------------------------------------------------
+# --- 7. Optional: reboot ---------------------------------------------------------------
 reboot_pi() {
     echo ">>> Rebooting the Raspberry Pi ..."
     if run_remote "sudo -n reboot"; then
@@ -622,8 +719,11 @@ reboot_pi() {
 print_banner
 test_connection
 preflight
+check_source
+check_rfid_reader pre
 upload_config
 run_installer
+check_rfid_reader post
 
 echo ""
 echo "==============================================================="
@@ -631,6 +731,11 @@ echo "  Installation completed successfully!"
 echo "==============================================================="
 echo " The installation log is on the Pi at ~/INSTALL-<id>.log"
 echo " (the path was printed during the installation: INSTALLATION_LOGFILE=...)."
+echo ""
+echo " RFID reader    : ${RFID_CHECK_STATUS:-${RFID_EFFECTIVE_MODULE:-not configured}}"
+if [[ "${RFID_CHECK_WARNINGS:-0}" -gt 0 ]]; then
+    echo "                  ${RFID_CHECK_WARNINGS} warning(s) - see the reader check above"
+fi
 echo ""
 echo " Continue with the configuration:"
 echo "   https://github.com/${GIT_USER}/RPi-Jukebox-RFID/blob/${GIT_BRANCH}/documentation/builders/configuration.md"
