@@ -99,6 +99,36 @@ RFID_READER_PARAMS="device_path=usb:072f:2200"
 RFID_READER_DEPS=auto
 
 # -----------------------------------------------------------------------------
+# I2C GPIO expander (Adafruit MCP23017, product 5346)
+# -----------------------------------------------------------------------------
+# Set ENABLE_MCP23017=true when the breakout is connected. The application
+# installer enables the I2C interface, adds the device-tree overlay "mcp23017"
+# and installs i2c-tools; after the reboot the expander appears as a gpiochip.
+# The button-to-action mapping is configured in shared/settings/mcp23017.yaml.
+#
+# The address range is 0x20-0x27; set it with the A0/A1/A2 jumpers on the
+# breakout. 0x20 is free on a Phoniebox with the usual I2C devices:
+#   0x24 PN532 reader, 0x28 MFRC522 reader, 0x3C OLED, 0x40 INA219, 0x48 ADS1015.
+# Change the value only when another device already uses 0x20.
+ENABLE_MCP23017=false
+MCP23017_ADDRESS=0x20
+MCP23017_I2C_BUS=1
+
+# -----------------------------------------------------------------------------
+# Waveshare UPS Module 3S (INA219)
+# -----------------------------------------------------------------------------
+# Set ENABLE_UPS3S=true when the module is connected. The module reports
+# battery voltage, current, power and percentage through an INA219 at I2C
+# address 0x41. The setup installs a small monitor service and enables the
+# battery display of the application on the monitor's status file. The module
+# uses the I2C bus, not a free GPIO line; 0x41 does not conflict with the
+# PowerBlock (GPIO 17/18) or the MCP23017 (0x20).
+ENABLE_UPS3S=false
+UPS3S_I2C_BUS=1
+UPS3S_I2C_ADDRESS=0x41
+UPS3S_INTERVAL=10
+
+# -----------------------------------------------------------------------------
 # Services
 # -----------------------------------------------------------------------------
 ENABLE_SAMBA=false

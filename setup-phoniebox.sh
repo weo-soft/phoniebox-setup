@@ -10,15 +10,19 @@
 # file (--config <file>). This script handles the complete flow:
 #   1. Establish an SSH connection to the Pi (IP, user, password)
 #   2. Run pre-flight checks on the Pi (OS, architecture, python3, wget, apt)
-#   3. Stop the jukebox service of an existing installation (it makes the
+#   3. Verify the installation source (raw.githubusercontent.com)
+#   4. Validate the MCP23017 settings (the application installer sets it up)
+#   5. Configure the Waveshare UPS Module 3S (INA219) monitor when it is enabled
+#   6. Stop the jukebox service of an existing installation (it makes the
 #      installer skip the reader registration)
-#   4. Verify the installation source (raw.githubusercontent.com)
-#   5. Check the configured RFID reader against the hardware on the Pi
-#   6. Upload the application config to /tmp/install_config.env
-#   7. Download install-jukebox.sh and run it non-interactively with --config
-#   8. Check the installed reader configuration against the hardware again
-#   9. Start the jukebox service again
-#  10. optionally: reboot the Raspberry Pi (--reboot)
+#   7. Check the configured RFID reader against the hardware on the Pi
+#   8. Upload the application config to /tmp/install_config.env
+#   9. Download install-jukebox.sh and run it non-interactively with --config
+#  10. Check the reader configuration and the MCP23017
+#  11. Enable the battery display in the application configuration and restart
+#      the jukebox service so it loads the new settings
+#  12. Check the UPS 3S, the running monitor and the battery display
+#  13. optionally: reboot the Raspberry Pi (--reboot)
 #
 # Configuration is split into two files:
 #   - .env               the script's OWN settings: SSH connection data
@@ -49,6 +53,24 @@ if [[ ! -f "$RFID_HELPER" ]]; then
 fi
 # shellcheck source=/dev/null
 source "$RFID_HELPER"
+
+# MCP23017 settings and the expander check
+MCP23017_HELPER="${SCRIPT_DIR}/mcp23017.sh"
+if [[ ! -f "$MCP23017_HELPER" ]]; then
+    echo "ERROR: MCP23017 helper not found: $MCP23017_HELPER" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$MCP23017_HELPER"
+
+# Waveshare UPS Module 3S (INA219) settings, installer and check
+UPS3S_HELPER="${SCRIPT_DIR}/ups3s.sh"
+if [[ ! -f "$UPS3S_HELPER" ]]; then
+    echo "ERROR: UPS 3S helper not found: $UPS3S_HELPER" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$UPS3S_HELPER"
 
 # Reader settings of the effective configuration, filled by
 # build_effective_config() and used by check_rfid_reader().
@@ -116,6 +138,19 @@ Examples:
   $(basename "$0") 192.168.1.50 pi            # password from .env
   $(basename "$0") 192.168.1.50 pi myPassword --reboot
   $(basename "$0") --source https://github.com/weo-soft/RPi-Jukebox-RFID/tree/future3/feature/installer-noninteractive-plugins
+
+MCP23017: the I2C GPIO expander is installed by the application installer
+when ENABLE_MCP23017=true in the application config. The keys are passed
+through, so the installer enables I2C, adds the device-tree overlay "mcp23017"
+(default address 0x20 on I2C bus 1) and creates the application settings. The
+PowerBlock uses GPIO 17/18 and has no I2C address, so both boards can share the
+40-pin header.
+
+UPS 3S: the Waveshare module's INA219 is read by a monitor service when
+ENABLE_UPS3S=true (address 0x41 on I2C bus 1). It also uses only the I2C bus,
+not a free GPIO line. The service writes /run/ups3s/status.json; the setup
+enables the battery plugin of the application on that file, so the Web App
+shows the charge level and the application evaluates the thresholds.
 
 Security: keep .env private (chmod 600). Prefer storing the
 password there instead of passing it on the command line.
@@ -404,8 +439,12 @@ build_effective_config() {
         exit 1
     fi
 
+    # The reader module and the UPS 3S keys are handled by this script and are
+    # not options of the upstream installer. ENABLE_MCP23017, MCP23017_ADDRESS
+    # and MCP23017_I2C_BUS are passed through: the installer enables I2C, adds
+    # the overlay and creates the application settings.
     # shellcheck disable=SC2016
-    grep -v -E '^[[:space:]]*(GIT_USER|GIT_BRANCH|SOURCE_URL|RFID_READER_MODULE)=' \
+    grep -v -E '^[[:space:]]*(GIT_USER|GIT_BRANCH|SOURCE_URL|RFID_READER_MODULE|ENABLE_UPS3S|UPS3S_[A-Z0-9_]+)=' \
         "$CONFIG_FILE" > "$EFFECTIVE_CONFIG" || true
 
     if [[ -n "$rfid_module" ]]; then
@@ -496,6 +535,29 @@ run_remote() {
     fi
 }
 
+# Runs a shell snippet on the Pi as root. With a password, sudo reads it from
+# stdin; without one, passwordless sudo is required (the official installer
+# needs that as well). The snippet must not contain single quotes.
+run_remote_sudo() {
+    local snippet="$1"
+    if [[ -n "$PASSWORD" ]]; then
+        printf '%s\n' "$PASSWORD" | SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo -S -p '' bash -c '${snippet}'"
+    else
+        ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo -n bash -c '${snippet}'"
+    fi
+}
+
+# Copies a local file to the Pi through the SSH connection. The destination is
+# a plain path chosen by the caller (for example /tmp/ups3s_monitor.py).
+run_remote_upload() {
+    local source="$1" destination="$2"
+    if [[ -n "$PASSWORD" ]]; then
+        SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "cat > '${destination}'" < "$source"
+    else
+        ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "cat > '${destination}'" < "$source"
+    fi
+}
+
 print_banner() {
     echo "==============================================================="
     echo "  Phoniebox (RPi-Jukebox-RFID) — Non-interactive Installation"
@@ -509,13 +571,27 @@ print_banner() {
         echo " Source (URL)   : ${SOURCE_URL}"
     fi
     echo " Source         : ${GIT_USER}/RPi-Jukebox-RFID @ ${GIT_BRANCH}"
+    if ! mcp23017_load_settings "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo " MCP23017       : invalid configuration"
+    elif [[ "$MCP23017_ENABLE" == "true" ]]; then
+        echo " MCP23017       : ${MCP23017_ADDRESS} on I2C bus ${MCP23017_BUS}"
+    else
+        echo " MCP23017       : disabled"
+    fi
+    if ! ups3s_load_settings "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo " UPS 3S         : invalid configuration"
+    elif [[ "$UPS3S_ENABLE" == "true" ]]; then
+        echo " UPS 3S         : INA219 ${UPS3S_ADDRESS} on I2C bus ${UPS3S_BUS}"
+    else
+        echo " UPS 3S         : disabled"
+    fi
     echo " Reboot         : $([ "$DO_REBOOT" = "true" ] && echo "yes (after success)" || echo "no")"
     echo " Host key check : $([ "$VERIFY_HOST_KEY" = "true" ] && echo "yes (accept-new, ${KNOWN_HOSTS_FILE})" || echo "no (not verified)")"
     echo " Detailed log   : $([ "$SHOW_LOG" = "true" ] && echo "yes (live tail of INSTALL-<id>.log)" || echo "no")"
     echo "---------------------------------------------------------------"
 }
 
-# --- 1. Test the SSH connection --------------------------------------------------
+# --- Test the SSH connection --------------------------------------------------
 test_connection() {
     echo ">>> Checking SSH connection to ${SSH_TARGET} ..."
     local out
@@ -532,7 +608,7 @@ test_connection() {
     echo "    $out"
 }
 
-# --- 2. Pre-flight checks on the Pi ----------------------------------------------
+# --- Pre-flight checks on the Pi ----------------------------------------------
 preflight() {
     echo ">>> Running pre-flight checks on the Pi ..."
     local preflight_cmd
@@ -563,7 +639,7 @@ preflight() {
     run_remote "$preflight_cmd"
 }
 
-# --- 3. The jukebox service of an existing installation --------------------------------
+# --- The jukebox service of an existing installation --------------------------------
 # The reader registration of the installer (run_register_rfid_reader.py) exits
 # without configuring anything while a jukebox service is active: no reader is
 # written to shared/settings/rfid.yaml and no reader dependency is installed.
@@ -617,7 +693,7 @@ start_jukebox_service() {
 # check, failed installation, interpreted signal).
 trap 'start_jukebox_service' EXIT
 
-# --- 4. Verify the installation source ----------------------------------------------
+# --- Verify the installation source ----------------------------------------------
 # The installer script is fetched from raw.githubusercontent.com on the Pi. This
 # check runs before the installer changes anything there, so a branch that does
 # not exist is reported together with the setting the value came from.
@@ -653,7 +729,99 @@ check_source() {
     return 0
 }
 
-# --- 5. Check the RFID reader --------------------------------------------------------
+# --- MCP23017 I2C GPIO expander ---------------------------------------------
+# The expander is installed by the application installer: the keys
+# ENABLE_MCP23017, MCP23017_ADDRESS and MCP23017_I2C_BUS are passed through
+# the --config file. This pre-flight step validates them, so an invalid
+# address never reaches the boot configuration.
+validate_mcp23017() {
+    echo ">>> Validating the I2C GPIO expander (MCP23017) settings"
+    if ! mcp23017_load_settings "$CONFIG_FILE"; then
+        echo "ERROR: Invalid MCP23017 settings in $CONFIG_FILE." >&2
+        exit 1
+    fi
+    if [[ "$MCP23017_ENABLE" == "true" ]]; then
+        echo "    ${MCP23017_ADDRESS} on I2C bus ${MCP23017_BUS}; the installer enables I2C and the overlay."
+    else
+        echo "    Disabled (ENABLE_MCP23017=false)."
+    fi
+    return 0
+}
+
+check_mcp23017() {
+    echo ">>> Checking the I2C GPIO expander (MCP23017)"
+    if ! mcp23017_load_settings "$CONFIG_FILE"; then
+        MCP23017_CHECK_STATUS="invalid configuration"
+        return 0
+    fi
+    if [[ "$MCP23017_ENABLE" != "true" ]]; then
+        echo "    Disabled (ENABLE_MCP23017=false)."
+        MCP23017_CHECK_STATUS="disabled"
+        return 0
+    fi
+    mcp23017_check || true
+}
+
+# --- Waveshare UPS Module 3S (INA219) ---------------------------------------
+# The monitor service reads the UPS over I2C; it is installed before the
+# application, because it does not depend on it. The application then gets the
+# battery block in its configuration, so the Web App shows the charge level.
+configure_ups3s() {
+    echo ">>> Configuring the Waveshare UPS Module 3S (INA219)"
+    if ! ups3s_load_settings "$CONFIG_FILE"; then
+        echo "WARNING: Invalid UPS 3S settings; the monitor is not configured." >&2
+        UPS3S_CHECK_STATUS="invalid configuration"
+        return 0
+    fi
+    if [[ "$UPS3S_ENABLE" != "true" ]]; then
+        echo "    Disabled (ENABLE_UPS3S=false)."
+        ups3s_disable || true
+        UPS3S_CHECK_STATUS="disabled"
+        return 0
+    fi
+    if ! ups3s_install "$CONFIG_FILE"; then
+        echo "WARNING: The UPS 3S configuration failed; the installation continues." >&2
+    fi
+    return 0
+}
+
+check_ups3s() {
+    echo ">>> Checking the Waveshare UPS Module 3S (INA219)"
+    if ! ups3s_load_settings "$CONFIG_FILE"; then
+        UPS3S_CHECK_STATUS="invalid configuration"
+        return 0
+    fi
+    if [[ "$UPS3S_ENABLE" != "true" ]]; then
+        echo "    Disabled (ENABLE_UPS3S=false)."
+        UPS3S_CHECK_STATUS="disabled"
+        return 0
+    fi
+    ups3s_check || true
+}
+
+# Enables the battery display of the application after the installation. The
+# configuration is written only once the application directory exists.
+configure_ups3s_app() {
+    echo ">>> Enabling the battery display in the application"
+    if ! ups3s_load_settings "$CONFIG_FILE"; then
+        echo "WARNING: Invalid UPS 3S settings; the display is not configured." >&2
+        UPS3S_APP_STATUS="invalid configuration"
+        return 0
+    fi
+    if [[ "$UPS3S_ENABLE" != "true" ]]; then
+        echo "    Disabled (ENABLE_UPS3S=false)."
+        ups3s_remove_app || true
+    elif ! ups3s_configure_app "$CONFIG_FILE"; then
+        echo "WARNING: The battery display could not be configured; the installation continues." >&2
+        return 0
+    fi
+    if ! ups3s_restart_app; then
+        echo "WARNING: Restart the jukebox service to load the battery configuration." >&2
+    fi
+    return 0
+}
+
+# --- Check the RFID reader --------------------------------------------------------
 # Compares the RFID reader of the application config with the hardware on the Pi.
 # 'pre' runs before the installation, so a wrong reader module can still be
 # corrected for this run. 'post' runs after the installation and compares the
@@ -678,7 +846,7 @@ check_rfid_reader() {
     rfid_check_summary
 }
 
-# --- 6. Upload the configuration ---------------------------------------------------
+# --- Upload the configuration ---------------------------------------------------
 upload_config() {
     echo ">>> Uploading config to /tmp/install_config.env ..."
     if [[ -n "$PASSWORD" ]]; then
@@ -690,7 +858,7 @@ upload_config() {
     echo "    Config uploaded ($(wc -l < "$EFFECTIVE_CONFIG") lines)."
 }
 
-# --- 7. Run the installer ------------------------------------------------------------
+# --- Run the installer ------------------------------------------------------------
 # Streams the installer's console output and, once the installer announces its
 # detailed log file (INSTALLATION_LOGFILE=...), tails that log LIVE in a
 # parallel SSH session until the installation finishes (--show-log).
@@ -758,7 +926,7 @@ run_installer() {
     echo "---------------------------------------------------------------"
 }
 
-# --- 8. Optional: reboot ---------------------------------------------------------------
+# --- Optional: reboot ---------------------------------------------------------------
 reboot_pi() {
     echo ">>> Rebooting the Raspberry Pi ..."
     if run_remote "sudo -n reboot"; then
@@ -776,13 +944,18 @@ reboot_pi() {
 print_banner
 test_connection
 preflight
-stop_jukebox_service
 check_source
+validate_mcp23017
+configure_ups3s
+stop_jukebox_service
 check_rfid_reader pre
 upload_config
 run_installer
 check_rfid_reader post
+check_mcp23017
+configure_ups3s_app
 start_jukebox_service
+check_ups3s
 
 echo ""
 echo "==============================================================="
@@ -795,6 +968,15 @@ echo " RFID reader    : ${RFID_CHECK_STATUS:-${RFID_EFFECTIVE_MODULE:-not config
 if [[ "${RFID_CHECK_WARNINGS:-0}" -gt 0 ]]; then
     echo "                  ${RFID_CHECK_WARNINGS} warning(s) - see the reader check above"
 fi
+echo " MCP23017       : ${MCP23017_CHECK_STATUS:-not checked}"
+if [[ "${MCP23017_CHECK_WARNINGS:-0}" -gt 0 ]]; then
+    echo "                  ${MCP23017_CHECK_WARNINGS} warning(s) - see the expander check above"
+fi
+echo " UPS 3S         : ${UPS3S_CHECK_STATUS:-not checked}"
+if [[ "${UPS3S_CHECK_WARNINGS:-0}" -gt 0 ]]; then
+    echo "                  ${UPS3S_CHECK_WARNINGS} warning(s) - see the UPS check above"
+fi
+echo " Battery display: ${UPS3S_APP_STATUS:-not configured}"
 echo ""
 echo " Continue with the configuration:"
 echo "   https://github.com/${GIT_USER}/RPi-Jukebox-RFID/blob/${GIT_BRANCH}/documentation/builders/configuration.md"
